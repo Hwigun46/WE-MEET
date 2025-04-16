@@ -19,7 +19,8 @@ jobs:
 
     - name: Build eBPF program + loader
       run: |
-        make  # or cd src && make
+        cd ebpf
+        make
 
     - name: Run verifier (libbpf based loader)
       run: |
