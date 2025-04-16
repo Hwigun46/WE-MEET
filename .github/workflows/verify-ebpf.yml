@@ -7,7 +7,6 @@ on:
 jobs:
   verify-ebpf:
     runs-on: ubuntu-latest
-    name: eBPF Build & Verify
 
     steps:
     - name: Checkout source
@@ -16,13 +15,12 @@ jobs:
     - name: Install build dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libelf-dev gcc-multilib make bpftool
+        sudo apt-get install -y clang llvm libelf-dev gcc-multilib make libbpf-dev
 
-    - name: Build eBPF Program
+    - name: Build eBPF program + loader
       run: |
-        cd ebpf
-        make
+        make  # or cd src && make
 
-    - name: Run verifier
+    - name: Run verifier (libbpf based loader)
       run: |
-        sudo bpftool prog load ./prog.o /sys/fs/bpf/my_prog
+        ./ebpf-loader
