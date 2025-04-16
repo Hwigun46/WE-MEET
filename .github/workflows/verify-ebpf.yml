@@ -1,0 +1,28 @@
+name: Verify eBPF Build
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  verify-ebpf:
+    runs-on: ubuntu-latest
+    name: eBPF Build & Verify
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v3
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm libelf-dev gcc-multilib make bpftool
+
+    - name: Build eBPF Program
+      run: |
+        cd ebpf
+        make
+
+    - name: Run verifier
+      run: |
+        sudo bpftool prog load ./prog.o /sys/fs/bpf/my_prog
