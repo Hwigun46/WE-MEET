@@ -28,11 +28,9 @@ static int handle_process_create(struct trace_event_raw_sys_enter *ctx)
     // event type
     evt->base.event_type = EVENT_PROCESS_CREATE;
 
-    // pid & tid
+    // pid
     u64 pid_tgid = bpf_get_current_pid_tgid();
-
     evt->base.pid = pid_tgid >> 32;
-    evt->base.tid = pid_tgid & 0xFFFFFFFF;
 
     // ppid
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -44,20 +42,15 @@ static int handle_process_create(struct trace_event_raw_sys_enter *ctx)
     bpf_core_read(&parent, sizeof(parent), &task->real_parent);
     bpf_core_read(&evt->base.ppid, sizeof(evt->base.ppid), &parent->tgid);
 
-    // uid & gid
+    // uid
     u64 uid_gid = bpf_get_current_uid_gid();
-
     evt->base.uid = uid_gid >> 32;
-    evt->base.gid = uid_gid & 0xFFFFFFFF;
 
     // comm
     bpf_get_current_comm(&evt->base.comm, sizeof(evt->base.comm));
 
     // timestamp
-    // evt->base.timestamp_ns = bpf_ktime_get_ns();
-
-    // start_time_ns
-    bpf_probe_read_kernel(&evt->start_time_ns, sizeof(evt->start_time_ns), &task->start_time);
+    evt->base.timestamp_ns = bpf_ktime_get_ns();
 
     // event map에 보내기
     bpf_ringbuf_submit(evt, 0);
