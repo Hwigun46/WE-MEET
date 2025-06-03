@@ -1,0 +1,12 @@
+# 커널 헤더
+vmlinux.h
+
+# Go 의존성 캐시 등
+*.out
+*.o
+
+# ide 세팅
+.vscode/
+
+# build 결과물
+build/

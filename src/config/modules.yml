@@ -1,0 +1,39 @@
+modules:
+  - path: "build/process_create.bpf.o"
+    mapname: "process_create_event_map"
+    programs:
+      handle_process_create:
+        function: "syscalls:sys_enter_execve"
+        type: "tracepoint"
+
+  - path: "build/process_terminate.bpf.o"
+    mapname: "process_terminate_event_map"
+    programs:
+      handle_process_terminate:
+        function: "do_exit"
+        type: "kprobe"
+
+  - path: "build/file_open.bpf.o"
+    mapname: "file_open_event_map"
+    programs:
+      handle_file_open:
+        function: "syscalls:sys_enter_openat"
+        type: "tracepoint"
+
+  - path: "build/tcp_connect.bpf.o"
+    mapname: "tcp_connect_event_map"
+    programs:
+      handle_tcp_connect_kprobe:
+        function: "tcp_connect"
+        type: "kprobe"
+      handle_tcp_connect_kretprobe:
+        function: "tcp_connect"
+        type: "kretprobe"
+
+  - path: "build/shell.bpf.o"
+    mapname: "shell_cmd_event_map"
+    programs:
+      handle_shell_cmd:
+        function: "readline"
+        type: "uretprobe"
+        binary: "/bin/bash"

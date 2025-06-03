@@ -4,30 +4,25 @@
 #include <bpf/bpf_tracing.h>
 #include "common.h"
 
-// 라이센스 설정
 char LICENSE[] SEC("license") = "GPL";
 
-// 맵 타입 설정
 struct
 {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 24);
-} process_terminate_event_map SEC(".maps");
+} shell_cmd_event_map SEC(".maps");
 
-// 프로세스 종료 Tracepoint
-// 프로세스 종료는 내부 커널 함수로 처리된다 syscall이 아닌 -> 동적 Tracepoint를 사용
-SEC("kprobe/do_exit")
-// 동적 Tracepoint의 경우에는 ctx 타입이 당시 register의 주소 정보로 받는다
-static int handle_process_terminate(struct pt_regs *ctx)
+SEC("uretprobe/bash:readline")
+static int handle_shell_cmd(struct pt_regs *ctx)
 {
+    struct shell_cmd_event_t *evt;
+    evt = bpf_ringbuf_reserve(&shell_cmd_event_map, sizeof(*evt), 0);
 
-    struct process_terminate_event_t *evt;
-    evt = bpf_ringbuf_reserve(&process_terminate_event_map, sizeof(*evt), 0);
     if (!evt)
         return 0;
 
     // event type
-    evt->base.event_type = EVENT_PROCESS_TERMINATE;
+    evt->base.event_type = EVENT_SHELL_CMD;
 
     // pid
     u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -47,13 +42,15 @@ static int handle_process_terminate(struct pt_regs *ctx)
     // comm
     bpf_get_current_comm(&evt->base.comm, sizeof(evt->base.comm));
 
+    // filename
+
     // timestamp
     evt->base.timestamp_ns = bpf_ktime_get_ns();
 
-    // exit_code
-    evt->exit_code = PT_REGS_PARM1(ctx);
+    // readline
+    const char *line_ptr = (const char *)PT_REGS_RC(ctx);
+    bpf_probe_read_user_str(&evt->command, sizeof(evt->command), line_ptr);
 
-    // event map에 보내기
     bpf_ringbuf_submit(evt, 0);
     return 0;
 }

@@ -4,41 +4,34 @@
 #define __COMMON_H
 
 // event 타입
-enum event_type_t
+enum custom_event_type_t
 {
     EVENT_PROCESS_CREATE,
     EVENT_PROCESS_TERMINATE,
     EVENT_FILE_OPEN,
     EVENT_TCP_CONNECT,
-    EVENT_SHELL_CMD
+    EVENT_SHELL_CMD,
+    EVENT_PRIVILEGE_CHANGE,
+    EVENT_BPF_LOAD
 };
-
-struct
-{
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-} event_output_map SEC(".maps");
 
 // 기본 구조체
 struct base_event_t
 {
 
-    enum event_type_t event_type;
+    enum custom_event_type_t event_type;
 
-    u32 pid;              // 프로세스 ID
-    u32 tid;              // 쓰레드 ID
-    u32 ppid;             // 부모 PID
-    u32 uid;              /// 사용자 ID
-    u32 gid;              // 그룹 ID
-    char comm[16];        // 명령어
-    char parent_comm[16]; // 부모 프로세스 이름
-    u64 timestamp_ns;     // 실행 시간
+    u32 pid;  // 프로세스 ID
+    u32 ppid; // 부모 PID
+    u32 uid;  /// 사용자
+    char comm[16];    // 명령어
+    u64 timestamp_ns; // 실행 시간
 };
 
 // 프로세스 생성 log 구조체
 struct process_create_event_t
 {
     struct base_event_t base;
-    u64 start_time_ns; // task_struct의 프로세스 시작 시간
 };
 
 // 프로세스 종료 log 구조체
@@ -71,7 +64,8 @@ struct tcp_connect_event_t
 };
 
 // map에 들어갈 sock 정보
-struct sock_info_t {
+struct sock_info_t
+{
     u32 saddr;
     u32 daddr;
     u16 sport;
@@ -83,6 +77,23 @@ struct shell_cmd_event_t
 {
     struct base_event_t base;
     char command[256]; // Full command line
+};
+
+// map에 들어갈 기존 uid 정보
+struct euid_info_t
+{
+    u32 pid;
+    u32 old_uid;
+    u32 old_euid;
+};
+
+// 권한 변경 log 구조체
+struct privilege_change_event_t
+{
+    struct base_event_t base;
+    u32 old_uid;
+    u32 old_euid;
+    u32 new_euid;
 };
 
 #endif
