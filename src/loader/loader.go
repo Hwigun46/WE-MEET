@@ -1,78 +1,26 @@
-package main
+package loader
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
+
+	"github.com/hwigun/WE-MEET/config"
 )
-
-// Event struct definitions matching the C structs in common.h
-type BaseEvent struct {
-	EventType   uint32
-	PID         uint32
-	TID         uint32
-	PPID        uint32
-	UID         uint32
-	GID         uint32
-	Comm        [16]byte
-	TimestampNs uint64
-}
-
-type ProcessCreateEvent struct {
-	BaseEvent
-	StartTimeNs uint64
-}
-
-type ProcessTerminateEvent struct {
-	BaseEvent
-	ExitCode   int32
-	DurationNs uint64
-}
-
-type FileOpenEvent struct {
-	BaseEvent
-	Filename [256]byte
-	Flags    int32
-	Mode     int32
-}
-
-type TCPConnectEvent struct {
-	BaseEvent
-	Saddr    uint32
-	Daddr    uint32
-	Sport    uint16
-	Dport    uint16
-	Protocol uint8
-}
-
-type ShellCmdEvent struct {
-	BaseEvent
-	Command [128]byte
-}
-
-type PrivilegeChangeEvent struct {
-	BaseEvent
-	OldUID  uint32
-	OldEUID uint32
-	NewEUID uint32
-}
 
 // 어디에 attach 할지 확인하기
 type AttachInfo struct {
 	Function string
 	Type     string
+	Binary   string
 }
 
 // .bpf.o 파일 형태
@@ -82,120 +30,49 @@ type BPFModule struct {
 	Mapname  string
 }
 
-// json 출력용 base struct
-type JSONBaseEvent struct {
-	EventType uint32 `json:"EventType"`
-	PID       uint32 `json:"PID"`
-	TID       uint32 `json:"TID"`
-	PPID      uint32 `json:"PPID"`
-	UID       uint32 `json:"UID"`
-	GID       uint32 `json:"GID"`
-	Comm      string `json:"Comm"`
-	Timestamp string `json:"Timestamp"`
+type Loader interface {
+	Run() error
+	Close() error
 }
 
-func main() {
+type UnifiedLoader struct {
+	modules []BPFModule
+	readers []*ringbuf.Reader
+	links   []link.Link
+}
+
+func (l *UnifiedLoader) Run() error {
 
 	// 메모리 제한 안두기
 	if err := rlimit.RemoveMemlock(); err != nil {
-		panic(fmt.Sprintf("failed to remove memlock: %v", err))
+		return fmt.Errorf("failed to remove memlock: %w", err)
 	}
 
+	// 부팅 시점 기록
 	var bootTimeOffsetNs int64
 	var once sync.Once
 
-	modules := []BPFModule{
+	// index는 사용 안해서 _ 처리 , mod에 modules 값 하나씩 반환
+	for _, mod := range l.modules {
 
-		{
-			Path: "build/process_create.bpf.o",
-			Programs: map[string]AttachInfo{
-				"handle_process_create": {
-					Function: "syscalls:sys_enter_execve",
-					Type:     "tracepoint",
-				},
-			},
-			Mapname: "process_create_event_map",
-		},
-
-		{
-			Path: "build/process_terminate.bpf.o",
-			Programs: map[string]AttachInfo{
-				"handle_process_terminate": {
-					Function: "do_exit",
-					Type:     "kprobe",
-				},
-			},
-			Mapname: "process_terminate_event_map",
-		},
-
-		{
-			Path: "build/file_open.bpf.o",
-			Programs: map[string]AttachInfo{
-				"handle_file_open": {
-					Function: "syscalls:sys_enter_openat",
-					Type:     "tracepoint",
-				},
-			},
-			Mapname: "file_open_event_map",
-		},
-
-		{
-			Path: "build/tcp_connect.bpf.o",
-			Programs: map[string]AttachInfo{
-				"handle_tcp_connect_kprobe": {
-					Function: "tcp_connect",
-					Type:     "kprobe",
-				},
-				"handle_tcp_connect_kretprobe": {
-					Function: "tcp_connect",
-					Type:     "kretprobe",
-				},
-			},
-			Mapname: "tcp_connect_event_map",
-		},
-
-		{
-			Path: "build/shell_cmd.bpf.o",
-			Programs: map[string]AttachInfo{
-				"handle_shell_cmd": {
-					Function: "sys_execve",
-					Type:     "kprobe",
-				},
-			},
-			Mapname: "shell_cmd_event_map",
-		},
-
-		{
-			Path: "build/privilege_change.bpf.o",
-			Programs: map[string]AttachInfo{
-				"handle_privilege_change_kprobe": {
-					Function: "sys_setreuid",
-					Type:     "kprobe",
-				},
-
-				"handle_privilege_change_kretprobe": {
-					Function: "sys_setreuid",
-					Type:     "kretprobe",
-				},
-			},
-			Mapname: "privilege_change_event_map",
-		},
-	}
-
-	for _, mod := range modules {
-
+		//
 		if _, err := os.Stat(mod.Path); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "skipping %s: file dose not exist\n", mod.Path)
+			fmt.Fprintf(os.Stderr, "skipping %s: file does not exist\n", mod.Path)
 			continue
 		}
 
+		// LoadCollectionSpec이 spec과 err를 반환
+		// spec은 .bpf.o 파일에 정의된 프로그램과 맵 등 메타데이터
+		// err가 nil이 아니면 err 처리
 		spec, err := ebpf.LoadCollectionSpec(mod.Path)
-
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to load BPF spec from %s: %v\n", mod.Path, err)
 			continue
 		}
 
+		// NewCollection이 coll과 err를 반환
+		// coll은 로딩된 BPF 프로그램들과 맵들을 담고 있는 Collection 객체
+		// err가 nil이 아니면 err 처리
 		coll, err := ebpf.NewCollection(spec)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to load BPF collection from %s: %v\n", mod.Path, err)
@@ -205,6 +82,8 @@ func main() {
 		for progName, attach := range mod.Programs {
 			prog := coll.Programs[progName]
 
+			// prog는 nil이면 null과 비슷한거
+			// 문제가 있다는 뜻
 			if prog == nil {
 				fmt.Fprintf(os.Stderr, "program %s not found in %s\n", progName, mod.Path)
 				continue
@@ -228,6 +107,22 @@ func main() {
 			case "kretprobe":
 				lnk, err = link.Kretprobe(attach.Function, prog, nil)
 
+			case "uretprobe":
+				if attach.Binary == "" {
+					fmt.Fprintf(os.Stderr, "missing binary path for %s: %s\n", attach.Type, progName)
+					continue
+				}
+				if attach.Function == "" {
+					fmt.Fprintf(os.Stderr, "missing symbol name for %s: %s\n", attach.Type, progName)
+					continue
+				}
+				exe, openErr := link.OpenExecutable(attach.Binary)
+				if openErr != nil {
+					fmt.Fprintf(os.Stderr, "failed to open binary %s: %v\n", attach.Binary, openErr)
+					continue
+				}
+				lnk, err = exe.Uretprobe(attach.Function, prog, nil)
+
 			default:
 				fmt.Fprintf(os.Stderr, "unsupported attach type %s for %s\n", attach.Type, progName)
 				continue
@@ -237,7 +132,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to attach %s to %s: %v\n", progName, attach.Function, err)
 				continue
 			}
-			defer lnk.Close()
+			l.links = append(l.links, lnk)
 		}
 
 		eventMap := coll.Maps[mod.Mapname]
@@ -254,201 +149,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to create perf reader for %s: %v\n", mod.Path, err)
 			continue
 		}
-		defer reader.Close()
+		l.readers = append(l.readers, reader)
 
-		go func(modName string, rdr *ringbuf.Reader) {
-			for {
-				record, err := rdr.Read()
-				if err != nil {
-					continue
-				}
-
-				// 먼저 BaseEvent만 읽어서 event_type을 확인
-				var base BaseEvent
-				if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &base); err != nil {
-					fmt.Printf("failed to parse base event from %s: %v\n", modName, err)
-					continue
-				}
-				once.Do(func() {
-					bootTimeOffsetNs = time.Now().UnixNano() - int64(base.TimestampNs)
-				})
-
-				switch base.EventType {
-				case 0: // EVENT_PROCESS_CREATE
-					var fullEvent ProcessCreateEvent
-					if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &fullEvent); err != nil {
-						fmt.Printf("failed to parse ProcessCreateEvent from %s: %v\n", modName, err)
-						continue
-					}
-					commStr := strings.TrimRight(string(fullEvent.Comm[:]), "\x00")
-					timestampStr := time.Unix(0, int64(fullEvent.TimestampNs)+bootTimeOffsetNs).Local().String()
-					output, _ := json.MarshalIndent(struct {
-						JSONBaseEvent
-						StartTimeNs uint64 `json:"StartTimeNs"`
-					}{
-						JSONBaseEvent: JSONBaseEvent{
-							EventType: fullEvent.EventType,
-							PID:       fullEvent.PID,
-							TID:       fullEvent.TID,
-							PPID:      fullEvent.PPID,
-							UID:       fullEvent.UID,
-							GID:       fullEvent.GID,
-							Comm:      commStr,
-							Timestamp: timestampStr,
-						},
-						StartTimeNs: fullEvent.StartTimeNs,
-					}, "", "  ")
-					fmt.Printf("[%s] EVENT JSON: %s\n", modName, output)
-				case 1: // EVENT_PROCESS_TERMINATE
-					var fullEvent ProcessTerminateEvent
-					if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &fullEvent); err != nil {
-						fmt.Printf("failed to parse ProcessTerminateEvent from %s: %v\n", modName, err)
-						continue
-					}
-					commStr := strings.TrimRight(string(fullEvent.Comm[:]), "\x00")
-					timestampStr := time.Unix(0, int64(fullEvent.TimestampNs)+bootTimeOffsetNs).Local().String()
-					output, _ := json.MarshalIndent(struct {
-						JSONBaseEvent
-						ExitCode   int32  `json:"ExitCode"`
-						DurationNs uint64 `json:"DurationNs"`
-					}{
-						JSONBaseEvent: JSONBaseEvent{
-							EventType: fullEvent.EventType,
-							PID:       fullEvent.PID,
-							TID:       fullEvent.TID,
-							PPID:      fullEvent.PPID,
-							UID:       fullEvent.UID,
-							GID:       fullEvent.GID,
-							Comm:      commStr,
-							Timestamp: timestampStr,
-						},
-						ExitCode:   fullEvent.ExitCode,
-						DurationNs: fullEvent.DurationNs,
-					}, "", "  ")
-					fmt.Printf("[%s] EVENT JSON: %s\n", modName, output)
-				case 2: // EVENT_FILE_OPEN
-					var fullEvent FileOpenEvent
-					if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &fullEvent); err != nil {
-						fmt.Printf("failed to parse FileOpenEvent from %s: %v\n", modName, err)
-						continue
-					}
-					commStr := strings.TrimRight(string(fullEvent.Comm[:]), "\x00")
-					timestampStr := time.Unix(0, int64(fullEvent.TimestampNs)+bootTimeOffsetNs).Local().String()
-					filenameStr := strings.TrimRight(string(fullEvent.Filename[:]), "\x00")
-					output, _ := json.MarshalIndent(struct {
-						JSONBaseEvent
-						Filename string `json:"Filename"`
-						Flags    int32  `json:"Flags"`
-						Mode     int32  `json:"Mode"`
-					}{
-						JSONBaseEvent: JSONBaseEvent{
-							EventType: fullEvent.EventType,
-							PID:       fullEvent.PID,
-							TID:       fullEvent.TID,
-							PPID:      fullEvent.PPID,
-							UID:       fullEvent.UID,
-							GID:       fullEvent.GID,
-							Comm:      commStr,
-							Timestamp: timestampStr,
-						},
-						Filename: filenameStr,
-						Flags:    fullEvent.Flags,
-						Mode:     fullEvent.Mode,
-					}, "", "  ")
-					fmt.Printf("[%s] EVENT JSON: %s\n", modName, output)
-				case 3: // EVENT_TCP_CONNECT
-					var fullEvent TCPConnectEvent
-					if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &fullEvent); err != nil {
-						fmt.Printf("failed to parse TCPConnectEvent from %s: %v\n", modName, err)
-						continue
-					}
-					commStr := strings.TrimRight(string(fullEvent.Comm[:]), "\x00")
-					timestampStr := time.Unix(0, int64(fullEvent.TimestampNs)+bootTimeOffsetNs).Local().String()
-					output, _ := json.MarshalIndent(struct {
-						JSONBaseEvent
-						Saddr    uint32 `json:"Saddr"`
-						Daddr    uint32 `json:"Daddr"`
-						Sport    uint16 `json:"Sport"`
-						Dport    uint16 `json:"Dport"`
-						Protocol uint8  `json:"Protocol"`
-					}{
-						JSONBaseEvent: JSONBaseEvent{
-							EventType: fullEvent.EventType,
-							PID:       fullEvent.PID,
-							TID:       fullEvent.TID,
-							PPID:      fullEvent.PPID,
-							UID:       fullEvent.UID,
-							GID:       fullEvent.GID,
-							Comm:      commStr,
-							Timestamp: timestampStr,
-						},
-						Saddr:    fullEvent.Saddr,
-						Daddr:    fullEvent.Daddr,
-						Sport:    fullEvent.Sport,
-						Dport:    fullEvent.Dport,
-						Protocol: fullEvent.Protocol,
-					}, "", "  ")
-					fmt.Printf("[%s] EVENT JSON: %s\n", modName, output)
-				case 4: // EVENT_SHELL_CMD
-					var fullEvent ShellCmdEvent
-					if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &fullEvent); err != nil {
-						fmt.Printf("failed to parse ShellCmdEvent from %s: %v\n", modName, err)
-						continue
-					}
-					commStr := strings.TrimRight(string(fullEvent.Comm[:]), "\x00")
-					timestampStr := time.Unix(0, int64(fullEvent.TimestampNs)+bootTimeOffsetNs).Local().String()
-					commandStr := strings.TrimRight(string(fullEvent.Command[:]), "\x00")
-					output, _ := json.MarshalIndent(struct {
-						JSONBaseEvent
-						Command string `json:"Command"`
-					}{
-						JSONBaseEvent: JSONBaseEvent{
-							EventType: fullEvent.EventType,
-							PID:       fullEvent.PID,
-							TID:       fullEvent.TID,
-							PPID:      fullEvent.PPID,
-							UID:       fullEvent.UID,
-							GID:       fullEvent.GID,
-							Comm:      commStr,
-							Timestamp: timestampStr,
-						},
-						Command: commandStr,
-					}, "", "  ")
-					fmt.Printf("[%s] EVENT JSON: %s\n", modName, output)
-				case 5: // EVENT_PRIVILEGE_CHANGE
-					var fullEvent PrivilegeChangeEvent
-					if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &fullEvent); err != nil {
-						fmt.Printf("failed to parse PrivilegeChangeEvent from %s: %v\n", modName, err)
-						continue
-					}
-					commStr := strings.TrimRight(string(fullEvent.Comm[:]), "\x00")
-					timestampStr := time.Unix(0, int64(fullEvent.TimestampNs)+bootTimeOffsetNs).Local().String()
-					output, _ := json.MarshalIndent(struct {
-						JSONBaseEvent
-						OldUID  uint32 `json:"OldUID"`
-						OldEUID uint32 `json:"OldEUID"`
-						NewEUID uint32 `json:"NewEUID"`
-					}{
-						JSONBaseEvent: JSONBaseEvent{
-							EventType: fullEvent.EventType,
-							PID:       fullEvent.PID,
-							TID:       fullEvent.TID,
-							PPID:      fullEvent.PPID,
-							UID:       fullEvent.UID,
-							GID:       fullEvent.GID,
-							Comm:      commStr,
-							Timestamp: timestampStr,
-						},
-						OldUID:  fullEvent.OldUID,
-						OldEUID: fullEvent.OldEUID,
-						NewEUID: fullEvent.NewEUID,
-					}, "", "  ")
-					fmt.Printf("[%s] EVENT JSON: %s\n", modName, output)
-				default:
-					fmt.Printf("[%s] Unknown event type: %d\n", modName, base.EventType)
-				}
-			}
-		}(mod.Path, reader)
+		go Dispatch(mod.Path, reader, &bootTimeOffsetNs, &once)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -456,4 +159,46 @@ func main() {
 	<-sig // 여기서 대기하다가 Ctrl+C 입력 시 아래로 진행
 	fmt.Println("exiting")
 
+	return nil
+}
+
+func (l *UnifiedLoader) Close() error {
+	var err error
+	for _, rdr := range l.readers {
+		if closeErr := rdr.Close(); closeErr != nil {
+			err = closeErr
+		}
+	}
+	for _, lnk := range l.links {
+		if closeErr := lnk.Close(); closeErr != nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
+func NewUnifiedLoaderFromConfig(c *config.Config) *UnifiedLoader {
+	modules := make([]BPFModule, 0, len(c.Modules))
+
+	for _, m := range c.Modules {
+		modules = append(modules, BPFModule{
+			Path:    m.Path,
+			Mapname: m.Mapname,
+			Programs: func() map[string]AttachInfo {
+				progMap := make(map[string]AttachInfo)
+				for name, info := range m.Programs {
+					progMap[name] = AttachInfo{
+						Function: info.Function,
+						Type:     info.Type,
+						Binary:   info.Binary,
+					}
+				}
+				return progMap
+			}(),
+		})
+	}
+
+	return &UnifiedLoader{
+		modules: modules,
+	}
 }
